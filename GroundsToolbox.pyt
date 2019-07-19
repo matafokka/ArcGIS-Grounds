@@ -137,8 +137,15 @@ class GroundProcessor(object):
         removeFiles()
         arcpy.Delete_management(output)
         mkdir(path)
-        
-        arcpy.FeatureToPolygon_management([grounds, quarters, rivers], polygons) # Split grounds by rivers
+        if arcpy.Describe(rivers).shapeType == "Polyline":
+            arcpy.FeatureToPolygon_management([grounds, quarters, rivers], polygons) # Split grounds by everything
+        else:
+            polygons_temp = path + "polygons_temp.shp"
+            arcpy.FeatureToPolygon_management([grounds, quarters], polygons) # Split grounds by everything except rivers
+            arcpy.Erase_analysis(polygons, rivers, polygons_temp) # Remove rivers from grounds
+            arcpy.Delete_management(polygons) # Delete polygons file
+            arcpy.MultipartToSinglepart_management(polygons_temp, polygons) # Split multi parts to single parts
+            
         # Add field with area
         area_field = "Shape_area"
         arcpy.AddField_management(polygons, area_field, "DOUBLE")
@@ -154,7 +161,7 @@ class GroundProcessor(object):
         # We need to use temporary layer for SelectLayerByLocation_management()
         # This layer will store big polygons.
         # We'll also update them with smaller ones.
-        # But ArcGIS can't handle temporary layers correctly, so we save big polygons to output_temp file.
+        # But ArcGIS can't handle temporary layers properly, so we save big polygons to output_temp file.
         temp_big = "temp_big"
         arcpy.CopyFeatures_management(big_polygons, output) # Big polygons will be updated with merged ones. Finally, we'll get desired output.
         
