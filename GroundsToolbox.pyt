@@ -37,6 +37,7 @@ class GroundProcessor(object):
         self.label = "Ground Processor"
         self.description = """
         Processes grounds.
+        <p><b>Caution!</b> This script will remove folder and shapefile with name of resulting file!</p>
         <h4>Parameters</h4>
         <p><b>Quarters Features</b> -- holds quarters. Quarters should look like grid and have Polyline type.</p>
         <p><b>Grounds Features</b> -- holds grounds. Will be cutted by quarters and rivers. Must have Polygon type.</p>
@@ -108,19 +109,19 @@ class GroundProcessor(object):
 
     def execute(self, parameters, messages):
         """The source code of the tool."""
+        arcpy.env.overwriteOutput = True # Allows functions to overwrite files
         # Put parameters into vars
         quarters, grounds, rivers, area, output = parameters[0].valueAsText, parameters[1].valueAsText, parameters[2].valueAsText, parameters[3].valueAsText, parameters[4].valueAsText
         
         # Define file paths
         path = output + "/"
-        output_temp = path + "output_temp.shp" # Check temp_big variable for explanation
+        output_temp = path + "output_temp.shp"
         output = output + ".shp"
         # Splitting part
-        polygons = path + "polygons.shp"
         small_polygons = path + "small_polygons.shp"
-        big_polygons = path + "big_polygons.shp"
         # Parsing part
         current_polygon = path + "curr_polygon.shp"
+        current_neighbors_uncut = path + "curr_nbrs_u.shp"
         current_neighbors = path + "curr_nbrs.shp"
         current_neighbor = path + "curr_nbr.shp"
         current_intersection = path + "curr_inter.shp"
@@ -135,91 +136,73 @@ class GroundProcessor(object):
                 pass
         
         removeFiles()
-        arcpy.Delete_management(output)
+        
         mkdir(path)
         if arcpy.Describe(rivers).shapeType == "Polyline":
-            arcpy.FeatureToPolygon_management([grounds, quarters, rivers], polygons) # Split grounds by everything
+            arcpy.FeatureToPolygon_management([grounds, quarters, rivers], output) # Split grounds by everything
         else:
             polygons_temp = path + "polygons_temp.shp"
-            arcpy.FeatureToPolygon_management([grounds, quarters], polygons) # Split grounds by everything except rivers
-            arcpy.Erase_analysis(polygons, rivers, polygons_temp) # Remove rivers from grounds
-            arcpy.Delete_management(polygons) # Delete polygons file
-            arcpy.MultipartToSinglepart_management(polygons_temp, polygons) # Split multi parts to single parts
-            
+            arcpy.FeatureToPolygon_management([grounds, quarters], output) # Split grounds by everything except rivers
+            arcpy.Erase_analysis(output, rivers, polygons_temp) # Remove rivers from grounds
+            arcpy.MultipartToSinglepart_management(polygons_temp, output) # Split multi parts to single parts
+        
         # Add field with area
         area_field = "Shape_area"
-        arcpy.AddField_management(polygons, area_field, "DOUBLE")
-        arcpy.CalculateField_management(polygons, area_field, "!SHAPE.AREA@HECTARES!", "PYTHON_9.3")
+        arcpy.AddField_management(output, area_field, "DOUBLE")
         
-        # Split grounds into files with big and small polygons depending on given area
-        area_field_quotes = '"' + area_field + '"'
-        arcpy.Select_analysis(polygons, small_polygons, area_field_quotes + " <= " + area)
-        arcpy.Select_analysis(polygons, big_polygons, area_field_quotes + " > " + area)
+        # When script joins two small polygons, result's area may still be less than given.
+        # So we need to re-run whole process for this polygon or for all small polygons left. Doesn't matter in matter of performance.
+        # If last run didn't do anything then there are no small polygons left.
+        didnt_do_anything = False
+        while True:
+            # Get small polygons depending on given area.
+            arcpy.CalculateField_management(output, area_field, "!SHAPE.AREA@HECTARES!", "PYTHON_9.3")
+            if didnt_do_anything:
+                break
+            didnt_do_anything = True # Now we didn't do anything
+            arcpy.Select_analysis(output, small_polygons, '"' + area_field + '" <= ' + area)
+            # Temporary layer for SelectLayerByLocation_management()
+            temp_current = "current" # Current small polygon, used in first loop below
+            temp_nbr = "temp_nbr"
         
-        temp_current = "current" # Current small polygon, used in first loop below
-        
-        # We need to use temporary layer for SelectLayerByLocation_management()
-        # This layer will store big polygons.
-        # We'll also update them with smaller ones.
-        # But ArcGIS can't handle temporary layers properly, so we save big polygons to output_temp file.
-        temp_big = "temp_big"
-        arcpy.CopyFeatures_management(big_polygons, output) # Big polygons will be updated with merged ones. Finally, we'll get desired output.
-        
-        # Process all small grounds
-        for ground in arcpy.da.SearchCursor(small_polygons, ["OID@"]):
-            # Need to execute it here because temporary layers exists only in scope where beign filled desipite if they were initialized out of used scope
-            arcpy.Delete_management(temp_big)
-            arcpy.MakeFeatureLayer_management(output, temp_big)
-            # Create file with current polygon and open it as layer
-            arcpy.Select_analysis(small_polygons, current_polygon, '"FID" = ' + str(ground[0]))
-            arcpy.MakeFeatureLayer_management(current_polygon, temp_current)
-            
-            # Find neighbors of current polygon
-            arcpy.SelectLayerByLocation_management(temp_big, "SHARE_A_LINE_SEGMENT_WITH", temp_current, selection_type = "NEW_SELECTION")
-            arcpy.CopyFeatures_management(temp_big, current_neighbors)
-            
-            # Process each neighbor
-            # Values for largest neighbor
-            max_area = 0
-            max_nbr_oid = None
-            for nbr in arcpy.da.SearchCursor(current_neighbors, ["OID@", "SHAPE@AREA"]):
-                # Create file with current neighbor
-                nbr_oid = str(nbr[0])
-                arcpy.Select_analysis(current_neighbors, current_neighbor, '"FID" = ' + nbr_oid)
-               
-                # Find if common edge of neighbor and current small ground is on river or quarter
-                arcpy.Intersect_analysis([temp_current, current_neighbor], current_intersection, "ALL", output_type = "LINE")
-                arcpy.Intersect_analysis([current_intersection, rivers], current_intersection_river, "ALL", output_type = "LINE")
-                arcpy.Intersect_analysis([current_intersection, quarters], current_intersection_quarter, "ALL", output_type = "LINE")
-                nbr_area = float(nbr[1])
+            # Process all small grounds
+            for ground in arcpy.da.SearchCursor(small_polygons, ["OID@"]):
+                # Create file with current polygon and open it as layer
+                arcpy.Select_analysis(small_polygons, current_polygon, '"FID" = ' + str(ground[0]))
+                arcpy.MakeFeatureLayer_management(current_polygon, temp_current)
                 
-                # If commong edge goes on river or quarter, intersection will return 1. 0 otherwise.
-                if nbr_area > max_area and arcpy.GetCount_management(current_intersection_river).getOutput(0) == "0" and arcpy.GetCount_management(current_intersection_quarter).getOutput(0) == "0":
-                    max_area, max_nbr_oid = nbr_area, nbr_oid
+                # Find neighbors of current polygon
+                arcpy.MakeFeatureLayer_management(output, temp_nbr)
+                arcpy.SelectLayerByLocation_management(temp_nbr, "SHARE_A_LINE_SEGMENT_WITH", temp_current, selection_type = "NEW_SELECTION")
+                arcpy.CopyFeatures_management(temp_nbr, current_neighbors_uncut)
+                arcpy.Erase_analysis(current_neighbors_uncut, current_polygon, current_neighbors)
                 
-                # Remove temporary crap
-                arcpy.Delete_management(current_neighbor)
-                arcpy.Delete_management(current_intersection)
-                arcpy.Delete_management(current_intersection_river)
-                arcpy.Delete_management(current_intersection_quarter)
-            
-            # Join ground with it's neighbor
-            if max_nbr_oid is not None:
-                arcpy.Select_analysis(current_neighbors, current_neighbor, '"FID" = ' + str(max_nbr_oid)) # Get neighbor with found ID
-                arcpy.Update_analysis(current_neighbor, current_polygon, current_updated_polygon) # Add current ground to it's neighbor
-                arcpy.Delete_management(current_polygon) # We'll re-use this
-                arcpy.Dissolve_management(current_updated_polygon, current_polygon, "FID", multi_part = "SINGLE_PART") # Dissolve polygons in updated file
-                # Update big polygons with new file and load result to big polygons
-                arcpy.Delete_management(output_temp)
-                arcpy.CopyFeatures_management(output, output_temp)
-                arcpy.Delete_management(output)
-                arcpy.Update_analysis(output_temp, current_polygon, output)
-            
-            # Remove temporary crap
-            arcpy.Delete_management(current_polygon)
-            arcpy.Delete_management(current_neighbors)
-            arcpy.Delete_management(current_neighbor)
-            arcpy.Delete_management(current_updated_polygon)
-            arcpy.Delete_management(temp_current)
-            
+                # Process each neighbor
+                # Values for largest neighbor
+                max_area = 0
+                max_nbr_oid = None
+                for nbr in arcpy.da.SearchCursor(current_neighbors, ["OID@", "SHAPE@AREA"]):
+                    # Create file with current neighbor
+                    nbr_oid = str(nbr[0])
+                    arcpy.Select_analysis(current_neighbors, current_neighbor, '"FID" = ' + nbr_oid)
+                   
+                    # Find if common edge of neighbor and current small ground is on river or quarter
+                    arcpy.Intersect_analysis([temp_current, current_neighbor], current_intersection, "ALL", output_type = "LINE")
+                    arcpy.Intersect_analysis([current_intersection, rivers], current_intersection_river, "ALL", output_type = "LINE")
+                    arcpy.Intersect_analysis([current_intersection, quarters], current_intersection_quarter, "ALL", output_type = "LINE")
+                    nbr_area = float(nbr[1])
+                    
+                    # If commong edge goes on river or quarter, intersection will return 1. 0 otherwise.
+                    if nbr_area > max_area and arcpy.GetCount_management(current_intersection_river).getOutput(0) == "0" and arcpy.GetCount_management(current_intersection_quarter).getOutput(0) == "0":
+                        max_area, max_nbr_oid = nbr_area, nbr_oid
+                
+                # Join ground with it's neighbor
+                if max_nbr_oid is not None:
+                    arcpy.Select_analysis(current_neighbors, current_neighbor, '"FID" = ' + str(max_nbr_oid)) # Get neighbor with found ID
+                    arcpy.Update_analysis(current_neighbor, current_polygon, current_updated_polygon) # Add current ground to it's neighbor
+                    arcpy.Dissolve_management(current_updated_polygon, current_polygon, "FID", multi_part = "SINGLE_PART") # Dissolve polygons in updated file
+                    # Update output with new new whole polygon
+                    arcpy.CopyFeatures_management(output, output_temp)
+                    arcpy.Update_analysis(output_temp, current_polygon, output)
+                    didnt_do_anything = False # Oh, we did something!
         removeFiles()
