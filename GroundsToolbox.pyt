@@ -205,4 +205,9 @@ class GroundProcessor(object):
                     arcpy.CopyFeatures_management(output, output_temp)
                     arcpy.Update_analysis(output_temp, current_polygon, output)
                     didnt_do_anything = False # Oh, we did something!
+        
+        # When quarters contains closed line, grounds will have ghost polygons.
+        # Intersection of original grounds and result will fix this problem.
+        arcpy.CopyFeatures_management(output, output_temp)
+        arcpy.Intersect_analysis([output_temp, grounds], output)
         removeFiles()
